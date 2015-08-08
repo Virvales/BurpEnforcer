@@ -13,13 +13,28 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 
-public class BurpExtender implements IBurpExtender, IScannerCheck {
+public class BurpExtender implements IBurpExtender, IScannerCheck, IHttpListener {
     private IBurpExtenderCallbacks callbacks;
     private IExtensionHelpers helpers;
     private OutputStream output;
     private Set<String> ScannedHosts = new HashSet<String>();
     private String uuid;
 
+
+    private static final Pattern PHP_ON_LINE = Pattern.compile("\\.php on line [0-9]+");
+    private static final Pattern PHP_FATAL_ERROR = Pattern.compile("Fatal error:");
+    private static final Pattern PHP_LINE_NUMBER = Pattern.compile("\\.php:[0-9]+");
+    private static final Pattern MSSQL_ERROR = Pattern.compile("\\[(ODBC SQL Server Driver|SQL Server)\\]");
+    private static final Pattern MYSQL_SYNTAX_ERROR = Pattern.compile("You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near");
+    private static final Pattern JAVA_LINE_NUMBER = Pattern.compile("\\.java:[0-9]+");
+    private static final Pattern JAVA_COMPILED_CODE = Pattern.compile("\\.java\\((Inlined )?Compiled Code\\)");
+    private static final Pattern ASP_STACK_TRACE = Pattern.compile("[A-Za-z\\.]+\\(([A-Za-z0-9, ]+)?\\) \\+[0-9]+");
+    private static final Pattern PERL_STACK_TRACE = Pattern.compile("at (\\/[A-Za-z0-9\\.]+)*\\.pm line [0-9]+");
+    private static final Pattern PYTHON_STACK_TRACE = Pattern.compile("File \"[A-Za-z0-9\\-_\\./]*\", line [0-9]+, in");
+    private static final Pattern ASP_NET = Pattern.compile("in [^\\s]\\.cs:[0-9]+");
+    private static final Pattern RUBY = Pattern.compile("\\.rb:[0-9 ]+:in ");
+    private static final Pattern NODEJS = Pattern.compile("[\\w\\/]+\\.js:[0-9]+:[0-9]+");
+    private static final Pattern ORA = Pattern.compile("ORA-[0-9]{4,}");
 
     //CRLF variables
     private static final String CRLFHeader = "Burp-Verification-Header: ";
@@ -29,6 +44,10 @@ public class BurpExtender implements IBurpExtender, IScannerCheck {
     private static String dirbRequest = "GET %s HTTP/1.1\nHOST: %s\n\n";
     private Set<String> scannedURLS = new HashSet<String>();
     private HashMap<String, Boolean> custom404 = new HashMap<String, Boolean>();
+    private Set<String> FoundTracebacks = new HashSet<String>();
+    private static final List<MatchRule> rules = new ArrayList();
+
+
 
 
     private static String CRLFDescription = "";
@@ -43,11 +62,12 @@ public class BurpExtender implements IBurpExtender, IScannerCheck {
 
         callbacks.setExtensionName("Burp enforcer");
         callbacks.registerScannerCheck(BurpExtender.this);
-        println("Burp enforcer 0.2");
+        callbacks.registerHttpListener(BurpExtender.this);
+        println("Burp enforcer 0.3");
 
         initCRLFSplitters();
         initDirBuster();
-
+        applyRules();
 
         CRLFDescription = "HTTP response splitting occurs when:<br/><ul>" +
                 "<li>Data enters a web application through an untrusted source, most frequently an HTTP request.</li>\n" +
@@ -233,7 +253,86 @@ public class BurpExtender implements IBurpExtender, IScannerCheck {
         if (!ScannedHosts.contains(scanHost)){
             ScannedHosts.add(scanHost);
             println("Scanning website " + scanHost);
+            IHttpChecker.checkRequest(scanHost, uuid, "domain");
         }
+    }
+
+    public void processHttpMessage(int toolFlag, boolean messageIsRequest, IHttpRequestResponse messageInfo) {
+
+        ArrayList<ScannerMatch> matches = new ArrayList<ScannerMatch>();
+        URL url = this.helpers.analyzeRequest(messageInfo).getUrl();
+        String urlAddress = url.getProtocol() + "://" + url.getHost() + ":" +
+                ((url.getPort() == -1) ? Integer.toString(url.getDefaultPort()):Integer.toString(url.getPort())) +
+                url.getPath();
+        if (FoundTracebacks.contains(urlAddress))
+        {
+            return;
+        }
+
+        if (this.callbacks.isInScope(url)){
+            if (!messageIsRequest) {
+                //URL url = this.helpers.analyzeRequest(messageInfo).getUrl();
+                if (this.callbacks.isInScope(url)) {
+                    IResponseInfo response = this.helpers.analyzeResponse(messageInfo.getResponse());
+                    if (response.getStatusCode() == 404 || response.getStatusCode() == 302 || response.getStatusCode() == 301) {
+                        return;
+                    }
+                    String raw_response = BurpExtender.this.helpers.bytesToString(messageInfo.getResponse());
+
+                    for (MatchRule rule : rules) {
+                        Matcher matcher = rule.getPattern().matcher(raw_response);
+                        while (matcher.find()) {
+                            println(new StringBuilder().append("FOUND ").append(rule.getType()).append("!").toString());
+                            String group;
+                            if (rule.getMatchGroup() != null)
+                                group = matcher.group(rule.getMatchGroup().intValue());
+                            else {
+                                group = matcher.group();
+                            }
+
+                            println(new StringBuilder().append("start: ").append(matcher.start()).append(" end: ").append(matcher.end()).append(" group: ").append(group).toString());
+
+                            matches.add(new ScannerMatch(matcher.start(), matcher.end(), group, rule.getType()));
+                        }
+
+                    }
+
+                    if (!matches.isEmpty()) {
+                        //Collections.sort(matches);
+
+                        ScannerMatch firstMatch = (ScannerMatch)matches.get(0);
+                        StringBuilder description = new StringBuilder(matches.size() * 256);
+                        description.append("The application displays detailed error messages when unhandled <b>").append(firstMatch.getType()).append("</b> exceptions occur.<br>");
+                        description.append("Stacktrace is - <b>").append(firstMatch.getMatch()).append("</b>");
+                        StringBuilder background = new StringBuilder();
+                        background.append("Stack traces are not vulnerabilities by themselves, but they often reveal information that is interesting to an attacker. Attackers attempt to generate these stack traces by tampering with the input to the web application with malformed HTTP requests and other input data.<br/>");
+                        background.append("If the application responds with stack traces that are not managed it could reveal information useful to attackers. This information could then be used in further attacks. Providing debugging information as a result of operations that generate errors is considered a bad practice due to multiple reasons. For example, it may contain information on internal workings of the application such as relative paths of the point where the application is installed or how objects are referenced internally. ");
+
+                        List startStop = new ArrayList(1);
+                        for (ScannerMatch match : matches) {
+                            println(new StringBuilder().append("Processing match: ").append(match).toString());
+                            println(new StringBuilder().append("    start: ").append(match.getStart()).append(" end: ").append(match.getEnd()).append(" match: ").append(match.getMatch()).append(" match: ").append(match.getMatch()).toString());
+
+                            startStop.add(new int[] { match.getStart(), match.getEnd() });
+                        }
+
+                        println(new StringBuilder().append("    Description: ").append(description.toString()).toString());
+
+                        callbacks.addScanIssue(new CustomScanIssue(messageInfo.getHttpService(),
+                                this.helpers.analyzeRequest(messageInfo).getUrl(),
+                                new IHttpRequestResponse[]{this.callbacks.applyMarkers(messageInfo, null, startStop)},
+                                "Detailed Error Messages Revealed",
+                                description.toString(),
+                                background.toString(),
+                                "Medium", "Firm"));
+                        FoundTracebacks.add(urlAddress);
+                        return ;
+                    }
+                }
+
+            }
+        }
+
     }
 
     public void initDirBuster()
@@ -289,6 +388,25 @@ public class BurpExtender implements IBurpExtender, IScannerCheck {
         CRLFSplitters.add("\r\t");
         CRLFSplitters.add("\r\n ");
         CRLFSplitters.add("\r\n\t");
+    }
+
+
+    private void applyRules()
+    {
+        rules.add(new MatchRule(PHP_ON_LINE, Integer.valueOf(0), "PHP"));
+        rules.add(new MatchRule(PHP_FATAL_ERROR, Integer.valueOf(0), "PHP"));
+        rules.add(new MatchRule(PHP_LINE_NUMBER, Integer.valueOf(0), "PHP"));
+        rules.add(new MatchRule(MSSQL_ERROR, Integer.valueOf(0), "Microsoft SQL Server"));
+        rules.add(new MatchRule(MYSQL_SYNTAX_ERROR, Integer.valueOf(0), "MySQL"));
+        rules.add(new MatchRule(JAVA_LINE_NUMBER, Integer.valueOf(0), "Java"));
+        rules.add(new MatchRule(JAVA_COMPILED_CODE, Integer.valueOf(0), "Java"));
+        rules.add(new MatchRule(ASP_STACK_TRACE, Integer.valueOf(0), "ASP.Net"));
+        rules.add(new MatchRule(PERL_STACK_TRACE, Integer.valueOf(0), "Perl"));
+        rules.add(new MatchRule(PYTHON_STACK_TRACE, Integer.valueOf(0), "Python"));
+        rules.add(new MatchRule(ASP_NET, Integer.valueOf(0), "ASPNET"));
+        rules.add(new MatchRule(RUBY, Integer.valueOf(0), "RUBY"));
+        rules.add(new MatchRule(NODEJS, Integer.valueOf(0), "NODEJS"));
+        rules.add(new MatchRule(ORA, Integer.valueOf(0), "Oracle DB"));
     }
 
 

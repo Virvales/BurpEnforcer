@@ -12,4 +12,6 @@ Burp does see vulnerability here, but this plugin does.
 
 3)Dirbuster Try to add extensions, that assosiated with temporary files (~, .bak, .tmp, etc) and check existance of a such file
 
+4)Errors sniffer. More details you can check her http://virvales.blogspot.com/2015/08/burp-stacktrace-sniffer.html
+
 In case of false-positives or false-negatives contact me vi virvales at gmail.com, I'll try to tune plugin
